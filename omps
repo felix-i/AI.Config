@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# omps - run omp inside a Bubblewrap sandbox.
+#
+# Based on the "box" script by Ivan Molodetskikh:
+#   https://bxt.rs/blog/easy-sandboxing-on-linux-with-bubblewrap/
+# adapted for omp:
+#   - ~/.omp is bound read-write: omp owns that directory by design, and
+#     this keeps sessions, stats and auth state persistent on the host.
+#     Only ~/.omp/run (host daemon sockets) is covered with a tmpfs.
+#   - node/bun toolchains are shared read-only.
+#   - the working directory is mounted read-write; everything else on the
+#     host is invisible or read-only.
+#
+# Usage:
+#   omps                    # like "omp", sandboxed
+#   omps -- <omp args...>   # e.g. "omps -- -p 'list files'" / "omps -- --continue"
+#
+# The leading "--" is optional: "omps -p hi" also works.
+#
+# Environment variables:
+#   OMP_RO_BINDS    extra space-separated host paths to bind read-only
+#   OMP_RW_BINDS    extra space-separated host paths to bind read-write
+#
+# Always passed through (no switch, by design):
+#   - Wayland socket (omp's browser tool; grants compositor access, see
+#     niri's security model docs on unsandboxed clients).
+#   - ssh-agent socket. The agent only holds the GitHub key scoped to AI
+#     agents (gnome-keyring); sandboxed omp can sign with it (git push).
+#     Note: anything else loaded into the agent later is also reachable.
+#
+# Known limits:
+#   - Sandboxed omp writes the real ~/.omp (sessions, stats, auth state);
+#     that is intentional, but it also means model-triggered writes there
+#     land on the host.
+#   - ~/.omp/run is hidden: host daemons are unreachable from the sandbox.
+#   - The private key file itself (~ssh and Credentials) stays unbound:
+#     signing goes through the agent socket only.
+
+set -euo pipefail
+
+REPO="$(readlink -f .)"
+
+# Refuse to launch from $HOME: the launch dir is RW-mounted into the
+# sandbox, and binding all of $HOME defeats the sandbox.
+if [[ "$REPO" == "$HOME" ]]; then
+  echo "omps: refusing to sandbox \$HOME (run from a project directory)" >&2
+  exit 1
+fi
+
+# Optional leading "--" separating omps flags from omp args.
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+CMD=("$@")
+
+# omp --cwd overrides the launch directory as workspace.
+cwd_next=0
+for arg in "${CMD[@]:-}"; do
+  if [[ "$cwd_next" -eq 1 ]]; then
+    REPO="$(readlink -f "$arg")"
+    cwd_next=0
+  elif [[ "$arg" == "--cwd" ]]; then
+    cwd_next=1
+  fi
+done
+if [[ "$REPO" == "$HOME" ]]; then
+  echo "omps: --cwd \$HOME would RW-mount all of \$HOME; refusing" >&2
+  exit 1
+fi
+
+BWRAP_ARGS=(
+  bwrap
+  --die-with-parent
+  --unshare-pid
+  --unshare-uts
+  --unshare-cgroup-try
+  --unshare-user-try
+  --cap-drop ALL
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /var
+  --dir /run
+  --dir "/run/user/$UID-sbox"
+  --dir /etc
+  --hostname sandbox
+)
+
+# --- Read-only system binds ---
+SYS_RO_BINDS=(
+  /usr
+  /bin
+  /sbin
+  /lib
+  /lib64
+  /etc/passwd
+  /etc/group
+  /etc/nsswitch.conf
+  /etc/machine-id
+  /etc/hosts
+  /etc/localtime
+  /etc/timezone
+  /etc/ssl
+  /etc/fonts
+)
+for p in "${SYS_RO_BINDS[@]}"; do
+  [[ -e "$p" ]] && BWRAP_ARGS+=( --ro-bind "$p" "$p" )
+done
+
+BWRAP_ARGS+=( --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache )
+
+# resolv.conf is typically a symlink into /run (systemd-resolved) which we
+# do not expose; bind the resolved real file instead.
+RESOLV_REAL="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
+if [[ -n "$RESOLV_REAL" && -f "$RESOLV_REAL" ]]; then
+  BWRAP_ARGS+=( --ro-bind "$RESOLV_REAL" /etc/resolv.conf )
+fi
+
+# --- Home: fresh dir, same path so host paths keep resolving ---
+BWRAP_ARGS+=( --setenv HOME "$HOME" --dir "$HOME" )
+
+# --- Home read-only binds: toolchains, tools, git config ---
+HOME_RO_BINDS=(
+  .hermes                          # node runtime (~/.hermes/node/bin)
+  .bun                             # bun runtime
+  .local/bin                       # omp, claude, hermes, plannotator
+  .local/share/claude              # claude CLI versions (~/.local/bin/claude target)
+  .nvm/versions/node/v24.18.0      # nvm node + openspec CLI
+  .config/gh                       # gh CLI config (read-only credential)
+  .config/opencode                  # opencode CLI
+  .config/openspec                  # openspec CLI
+  .cache/ms-playwright             # browser binaries for omp's browser tool
+)
+for rel in "${HOME_RO_BINDS[@]}"; do
+  [[ -e "$HOME/$rel" ]] && BWRAP_ARGS+=( --ro-bind "$HOME/$rel" "$HOME/$rel" )
+done
+
+# Extra user-supplied binds.
+if [[ -n "${OMP_RO_BINDS:-}" ]]; then
+  for p in $OMP_RO_BINDS; do
+    [[ -e "$p" ]] && BWRAP_ARGS+=( --ro-bind "$p" "$p" )
+  done
+fi
+if [[ -n "${OMP_RW_BINDS:-}" ]]; then
+  for p in $OMP_RW_BINDS; do
+    [[ -e "$p" ]] && BWRAP_ARGS+=( --bind "$p" "$p" )
+  done
+fi
+
+# --- Home cache mounts ---
+# RW: sandbox npm installs warm the host cache (same trust class as cwd).
+# ~/.cache/fontconfig is intentionally NOT bound: only Chromium (omp's
+# browser tool) reads it, and it regenerates in ~0.35s into the ephemeral
+# home on first browser launch.
+if [[ -d "$HOME/.npm" ]]; then
+  BWRAP_ARGS+=( --bind "$HOME/.npm" "$HOME/.npm" )
+fi
+
+if [[ -d "$HOME/.dotnet" ]]; then
+  BWRAP_ARGS+=( --overlay-src "$HOME/.dotnet" --tmp-overlay "$HOME/.dotnet" )
+fi
+
+# --- ~/.omp: bound read-write, sessions persist on the host ---
+# omp owns this directory (auth, sessions, stats, logs), so it stays live.
+# Only "run" is covered: it holds host daemon Unix sockets, and connecting
+# to a host daemon from inside the sandbox would be an escape hatch.
+if [[ -d "$HOME/.omp" ]]; then
+  BWRAP_ARGS+=( --bind "$HOME/.omp" "$HOME/.omp" )
+  BWRAP_ARGS+=( --tmpfs "$HOME/.omp/run" )
+fi
+
+# --- ~/.claude: rules + skills, read-only (writable only for --from-claude) ---
+if [[ "${CMD[*]:-}" == *"--from-claude"* ]]; then
+  BWRAP_ARGS+=( --bind "$HOME/.claude" "$HOME/.claude" )
+else
+  BWRAP_ARGS+=( --ro-bind "$HOME/.claude" "$HOME/.claude" )
+fi
+
+# --- Wayland socket for omp's browser tool (always on) ---
+# Grants compositor access (unsandboxed Wayland client) - accepted by
+# design; omp needs it to run a browser.
+XDG_RT="${XDG_RUNTIME_DIR:-}"
+WAYLAND_SOCK="${WAYLAND_DISPLAY:-wayland-0}"
+if [[ -n "$XDG_RT" && -S "$XDG_RT/$WAYLAND_SOCK" ]]; then
+  BWRAP_ARGS+=(
+    --bind "$XDG_RT/$WAYLAND_SOCK" "/run/user/$UID-sbox/$WAYLAND_SOCK"
+    --setenv XDG_RUNTIME_DIR "/run/user/$UID-sbox"
+    --setenv WAYLAND_DISPLAY "$WAYLAND_SOCK"
+  )
+fi
+
+# --- ssh-agent: only the AI-agent GitHub key is loaded (user decision) ---
+# Signing goes through the agent socket; private key files stay unbound.
+if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK:-}" ]]; then
+  BWRAP_ARGS+=( --ro-bind "$SSH_AUTH_SOCK" "/run/user/$UID-sbox/ssh-agent.sock" )
+  BWRAP_ARGS+=( --setenv SSH_AUTH_SOCK "/run/user/$UID-sbox/ssh-agent.sock" )
+fi
+
+# --- PATH (includes toolchain bins in use order) ---
+BWRAP_ARGS+=( --setenv PATH \
+  "$HOME/.hermes/node/bin:$HOME/.nvm/versions/node/v24.18.0/bin:$HOME/.bun/bin:$HOME/.local/bin:$HOME/.dotnet/tools:/usr/local/bin:/usr/bin:/bin" )
+
+# --- Extra workspace dirs from omp's --add-dir flag get RW binds ---
+add_dir_next=0
+for arg in "${CMD[@]:-}"; do
+  if [[ "$add_dir_next" -eq 1 ]]; then
+    absolute="$(readlink -f "$arg")"
+    BWRAP_ARGS+=( --bind "$absolute" "$absolute" )
+    add_dir_next=0
+  elif [[ "$arg" == "--add-dir" ]]; then
+    add_dir_next=1
+  fi
+done
+
+# --- Working directory: the only host folder omp can write ---
+BWRAP_ARGS+=( --bind "$REPO" "$REPO" --chdir "$REPO" )
+
+# --- Run: omp initializes against the workspace explicitly ---
+has_cwd=0
+for arg in "${CMD[@]:-}"; do
+  [[ "$arg" == "--cwd" ]] && has_cwd=1
+done
+if [[ "$has_cwd" -eq 0 ]]; then
+  exec "${BWRAP_ARGS[@]}" omp --cwd "$REPO" "${CMD[@]}"
+else
+  exec "${BWRAP_ARGS[@]}" omp "${CMD[@]}"
+fi

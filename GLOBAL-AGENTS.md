@@ -1,5 +1,5 @@
 * ALWAYS load the `caveman` skill via the skill tool at session start, BEFORE the first response. Default level: full. Active every turn thereafter; off only on explicit "stop caveman" / "normal mode".
-* Max 2 paragraphs per response.
+* ALWAYS use `modern-csharp-coding-standards` skill when writing C#
 * Never use em dash "—", use plain dash "-" instead.
 * Prefer simple solutions over complex ones.
 * Don't assume or hide confusion - surface tradeoffs.
